@@ -29,11 +29,13 @@ class ReleaseConsistency(unittest.TestCase):
         for nb in ("notebooks/18_stokastisk_qwen25_t4.ipynb", "notebooks/19_stokastisk_qwen25_coder_7b_dual_t4.ipynb"):
             self.assertIn("!" + PIN, "".join("".join(c["source"]) for c in json.loads((ROOT / nb).read_text())["cells"]), nb)
 
-    def test_no_document_recommends_the_extra_index_as_the_install(self):
+    def test_extra_index_install_line_is_the_one_supported_form(self):
+        simple = "pip install stokastisk --extra-index-url " + mpi.INDEX
+        for d in ("README.md", "docs/HUB_README.md"):
+            self.assertIn("!" + simple, (ROOT / d).read_text(), d)
         for d in ("README.md", "INSTALL.md", "docs/HUB_README.md", "docs/guide/getting-started.md", *(f"notebooks/{n}" for n in ("18_stokastisk_qwen25_t4.ipynb", "19_stokastisk_qwen25_coder_7b_dual_t4.ipynb"))):
-            t = (ROOT / d).read_text()
-            for m in re.finditer(r"^(?:!)?(?:python -m )?pip install stokastisk --extra-index-url", t, re.M):
-                self.fail(f"{d} uses --extra-index-url as its install command")
+            for m in re.finditer(r"^(?:!)?(?:python -m )?pip install stokastisk --extra-index-url (\S+)", (ROOT / d).read_text(), re.M):
+                self.assertEqual(m.group(1), mpi.INDEX, f"{d}: wrong index URL")
 
     def test_no_document_offers_the_withdrawn_build_as_an_install_or_rollback(self):
         for d in ("README.md", "INSTALL.md", "RELEASE.md", "docs/HUB_README.md", "docs/guide/getting-started.md", "docs/guide/troubleshooting.md"):
