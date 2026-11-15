@@ -22,17 +22,16 @@ That downloads the wheel (SDK + vLLM 0.25.1 + CUDA binaries, 38 MB) from the Hug
 
 **3. Run.** Engine code works in ordinary notebook cells (notebooks 18 and 19) and in scripts; in a **script** keep it under a `__main__` guard, because vLLM starts its engine in a spawned process:
 ```python
-%%writefile demo.py
+
 import stokastisk
 
-if __name__ == "__main__":
-    schema = {"type": "object", "required": ["city", "population"], "additionalProperties": False,
-              "properties": {"city": {"type": "string", "maxLength": 40}, "population": {"type": "integer", "minimum": 0, "maximum": 100000000}}}
-    with stokastisk.LLM("Qwen/Qwen2.5-0.5B-Instruct", config=stokastisk.StokastiskConfig(max_model_len=2048)) as llm:
-        print(llm.verify_attention_backend())                                    # TRITON_ATTN
-        print(llm.complete("The capital of France is", max_tokens=16))
-        print(llm.chat([{"role": "user", "content": "Say hello in five words."}])[0].outputs[0].text)
-        print(llm.generate_structured(["Describe Paris."], schema, max_tokens=96))   # JSON that satisfies the schema, or an error
+schema = {"type": "object", "required": ["city", "population"], "additionalProperties": False,
+          "properties": {"city": {"type": "string", "maxLength": 40}, "population": {"type": "integer", "minimum": 0, "maximum": 100000000}}}
+with stokastisk.LLM("Qwen/Qwen2.5-0.5B-Instruct", config=stokastisk.StokastiskConfig(max_model_len=2048)) as llm:
+    print(llm.verify_attention_backend())                                    # TRITON_ATTN
+    print(llm.complete("The capital of France is", max_tokens=16))
+    print(llm.chat([{"role": "user", "content": "Say hello in five words."}])[0].outputs[0].text)
+    print(llm.generate_structured(["Describe Paris."], schema, max_tokens=96))   # JSON that satisfies the schema, or an error
 ```
 then `!python demo.py`. Ready‑made notebooks (plain cells, no script needed): [notebooks/18_stokastisk_qwen25_t4.ipynb](notebooks/18_stokastisk_qwen25_t4.ipynb) (Qwen2.5‑0.5B TP=1, Qwen2.5‑3B TP=2 and PP=2) and [notebooks/19_stokastisk_qwen25_coder_7b_dual_t4.ipynb](notebooks/19_stokastisk_qwen25_coder_7b_dual_t4.ipynb) (Qwen2.5‑Coder‑7B‑Instruct, TP=2 and PP=2).
 
