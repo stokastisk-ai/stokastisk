@@ -162,6 +162,20 @@ def _tail(path: str | None, max_lines: int = 40, max_chars: int = 6000) -> str:
     return "\n".join(lines[-max_lines:])[-max_chars:] or "(the server wrote nothing)"
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(url_or_request: Any, timeout: float):
+    """``urlopen`` that never sends LOOPBACK requests through a proxy. Plain ``urlopen`` honours ``http_proxy`` and bypasses it only for hosts listed in
+    ``no_proxy``, so with a proxy variable set a request to the local server at 127.0.0.1 went to the proxy. Other hosts are unchanged."""
+    from urllib.parse import urlparse
+    url = url_or_request.full_url if isinstance(url_or_request, urllib.request.Request) else str(url_or_request)
+    if (urlparse(url).hostname or "") in _LOOPBACK_HOSTS:
+        return _DIRECT_OPENER.open(url_or_request, timeout=timeout)
+    return urllib.request.urlopen(url_or_request, timeout=timeout)
+
+
 def _proc_ids(pid: int) -> tuple[int, int] | None:
     """(process group, session) of ``pid`` from /proc/<pid>/stat, or None if it is gone or is a zombie."""
     try:
@@ -263,7 +277,7 @@ class ServerProcess:
     def health(self, timeout: float = 5.0) -> bool:
         """True if ``GET /health`` answers 200 right now."""
         try:
-            with urllib.request.urlopen(self.base_url + "/health", timeout=timeout) as r:
+            with _urlopen(self.base_url + "/health", timeout=timeout) as r:
                 return r.status == 200
         except (urllib.error.URLError, OSError, ValueError):
             return False
@@ -447,7 +461,7 @@ class ServerProcess:
 def _post_json(url: str, body: dict[str, Any], timeout: float):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        return _urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         raise ServerHTTPError(f"POST {url} failed", status=e.code, body=_read_error(e)) from e
     except (urllib.error.URLError, OSError) as e:
@@ -463,7 +477,7 @@ def _read_error(e: urllib.error.HTTPError) -> str:
 
 def _get(url: str, timeout: float) -> bytes:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with _urlopen(url, timeout=timeout) as r:
             return r.read()
     except urllib.error.HTTPError as e:
         raise ServerHTTPError(f"GET {url} failed", status=e.code, body=_read_error(e)) from e
