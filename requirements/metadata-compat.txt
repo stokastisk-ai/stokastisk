@@ -1,0 +1,15 @@
+# Bounded METADATA compatibility ranges (wheel Requires-Dist only). Each line REPLACES the exact `name==version` pin that the hash-pinned lock
+# closure would otherwise put into the wheel's METADATA. The locks themselves are unchanged: requirements/*.lock still hash-pins the tested version
+# for an environment that lacks the package.
+#
+# Rules enforced by scripts/release/build_integrated_wheel.py and scripts/audit/wheel_delta.py:
+#   * the package must already be pinned by a lock, and the locked version must satisfy the range;
+#   * the range must have an inclusive lower bound equal to the locked version and an exclusive upper bound within the same major.minor series.
+# Nothing else may be relaxed here.
+#
+# pydantic-settings: Kaggle's image (since the 2026-11-13 baseline) ships 2.16.3, the upstream SECURITY patch release (2026-11-13: the default
+# secrets source no longer follows symlinks outside secrets_dir). The build-5 exact pin 2.16.2 made `pip install` DOWNGRADE it, the only preinstalled
+# package the install replaced. Evidence: 2.16.2 and 2.16.3 declare identical Requires-Dist; vLLM 0.25.1 requires it UNPINNED (server extra); no
+# module in the bundled vLLM tree, in model-hosting-container-standards 0.1.16, or in Stokastisk imports `pydantic_settings` (it is only checked for
+# presence by stokastisk.dependencies). Bounded to the 2.16 series.
+pydantic-settings>=2.16.2,<2.17

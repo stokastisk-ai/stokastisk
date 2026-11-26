@@ -4,10 +4,12 @@ Background (Enigma x Kaggle fatal-session investigation, 2026-11-26): every Kagg
 is never refused by the kernel. After the server's leader has exited and been reaped, its PGID number can be reused by an unrelated new session leader
 (any ``start_new_session=True`` child, e.g. the Enigma connector). Linux never hands out a PID that is still in use as a group id, so: once our leader is
 reaped, a live process whose PID equals our PGID is NOT ours, while our own orphaned descendants never have that PID."""
-import os, pathlib, signal, subprocess, sys, time, unittest
+import os, pathlib, signal, subprocess, sys, threading, time, unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tests"))
 from test_serving_runtime import Fake          # noqa: E402  (reuses the fake interpreter / fake server)
+from stokastisk import serving                 # noqa: E402
 
 
 def alive(pid: int) -> bool:
@@ -62,9 +64,81 @@ class ProcessIdentity(Fake):
         os.kill(s.pid, signal.SIGKILL); s._proc.wait(5)    # leader dies by itself; its engine-core-like child keeps the group alive
         self.assertTrue(s._group_alive())
         s.stop(grace=1)
-        self.assertIn("SIGKILL(group)", s.shutdown_report["signals"]); self.assertTrue(s.shutdown_report["group_gone"])
+        self.assertIn("SIGKILL(orphans=1)", s.shutdown_report["signals"]); self.assertTrue(s.shutdown_report["group_gone"])
+        self.assertEqual(s.shutdown_report["orphan_signals_refused"], 0)
         with self.assertRaises(ProcessLookupError):
             os.killpg(pgid, 0)
+
+
+class OrphanCleanupIsRaceFree(Fake):
+    """After the leader is reaped, orphans are signalled one by one through a pidfd, only after re-verifying group AND session; killpg is never used."""
+
+    def sentinel(self):
+        s = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.1)"], start_new_session=True)
+        self.addCleanup(lambda: (s.kill(), s.wait(5)))
+        return s
+
+    def test_a_process_holding_the_pgid_number_is_never_signalled(self):
+        victim = self.sentinel()                          # its group and session ARE (victim.pid, victim.pid): exactly what a reused PGID looks like
+        s = serving.ServerProcess.__new__(serving.ServerProcess)
+        with mock.patch.object(serving, "_group_members", return_value=[victim.pid]):
+            done, refused = s._kill_orphans(victim.pid)
+        time.sleep(0.2)
+        self.assertEqual((done, refused), (0, 1)); self.assertTrue(alive(victim.pid))
+
+    def test_identity_is_rechecked_after_pinning_and_a_mismatch_is_refused(self):
+        victim = self.sentinel()
+        s = serving.ServerProcess.__new__(serving.ServerProcess)
+        with mock.patch.object(serving, "_group_members", return_value=[victim.pid]), mock.patch.object(serving, "_proc_ids", return_value=(1, 1)):
+            done, refused = s._kill_orphans(4242424)
+        time.sleep(0.2)
+        self.assertEqual((done, refused), (0, 1)); self.assertTrue(alive(victim.pid))
+
+    def test_without_pidfd_nothing_is_signalled(self):
+        victim = self.sentinel()
+        s = serving.ServerProcess.__new__(serving.ServerProcess)
+        with mock.patch.object(serving.os, "pidfd_open", None), mock.patch.object(serving, "_group_members", return_value=[victim.pid]):
+            self.assertEqual(s._kill_orphans(4242424), (0, 1))
+        self.assertTrue(alive(victim.pid))
+
+    def test_permission_error_counts_as_refused(self):
+        victim = self.sentinel()
+        s = serving.ServerProcess.__new__(serving.ServerProcess)
+        pg = os.getpgid(victim.pid)
+        with mock.patch.object(serving, "_group_members", return_value=[victim.pid]), mock.patch.object(serving, "_proc_ids", return_value=(pg + 1, pg + 1)), \
+                mock.patch.object(serving.signal, "pidfd_send_signal", side_effect=PermissionError):
+            self.assertEqual(s._kill_orphans(pg + 1), (0, 1))
+        self.assertTrue(alive(victim.pid))
+
+    def test_group_members_requires_both_group_and_session(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])          # same session as the test, own group? no: inherits ours
+        self.addCleanup(lambda: (child.kill(), child.wait(5)))
+        self.assertNotIn(child.pid, serving._group_members(child.pid))                           # its group/session are not (child.pid, child.pid)
+
+
+class LifecycleConcurrency(Fake):
+    def test_concurrent_stops_signal_once_and_both_return_after_shutdown(self):
+        s = self.srv(); s.start(); s.wait_ready(20, 0.1)
+        results = []
+        ts = [threading.Thread(target=lambda: results.append(s.stop(grace=10))) for _ in range(3)]
+        for t in ts: t.start()
+        for t in ts: t.join(60)
+        self.assertEqual(sorted(results, key=lambda r: r is None), [0, None, None])
+        self.assertEqual(s.shutdown_report["signals"], ["SIGINT"]); self.assertFalse(s.running)
+
+    def test_concurrent_start_and_stop_never_leave_a_server_running(self):
+        for _ in range(3):
+            s = self.srv()
+            t = threading.Thread(target=s.start); t.start()
+            s.stop(grace=10); t.join(30)
+            s.stop(grace=10)                                     # whichever order the lock chose, a final stop() leaves nothing behind
+            self.assertFalse(s.running); self.assertIsNone(s._pgid)
+
+    def test_failed_startup_closes_the_log_handle(self):
+        s = serving.ServerProcess("m", self.cfg, python="/nonexistent/python", log_path=str(self.td / "x.log"), port=serving.find_free_port())
+        with self.assertRaises(Exception):
+            s.start()
+        self.assertIsNone(s._log); self.assertIsNone(s.stop())
 
 
 if __name__ == "__main__":
