@@ -63,6 +63,13 @@ def locked(profile):
 # package to satisfy it. Pinning the whole lock closure exactly makes the set pip downloads deterministic; everything else is already satisfied by the Kaggle image and kept.
 hard_extra = sorted({r for prof in ("core", "structured-output", "serving") for r in locked(prof)}, key=str.lower)
 assert {canon(r.split("==")[0]) for r in core} <= {canon(r.split("==")[0]) for r in hard_extra}, "a lock root is missing from the pinned closure"
+
+
+sys.path.insert(0, str(ROOT / "scripts" / "release"))
+import metadata_compat  # noqa: E402
+
+COMPAT = metadata_compat.load(ROOT / "requirements" / "metadata-compat.txt", {canon(r.split("==")[0]): r.split("==")[1] for r in hard_extra})
+hard_extra = [COMPAT.get(canon(r.split("==")[0]), r) for r in hard_extra]       # bounded compatibility ranges replace exact pins in METADATA only
 EXTRA_REQ = ["torch==2.11.0+cu130", "triton==3.6.0"]
 
 with tempfile.TemporaryDirectory() as td:

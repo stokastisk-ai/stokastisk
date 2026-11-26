@@ -1,0 +1,15 @@
+{
+ "schema": 1,
+ "build_tag": "6",
+ "project_version": "0.1.0",
+ "status": "UNPUBLISHED CANDIDATE: never listed in RELEASE.json, the package index, Hugging Face or a GitHub release until it passes on Kaggle 2 x T4 and the owner approves it",
+ "reference_build": "5",
+ "allow_sdk": ["stokastisk/serving.py"],
+ "requires_compat": "requirements/metadata-compat.txt",
+ "expected_changed_members": {
+  "stokastisk/serving.py": "ServerProcess.stop() refuses to signal a process group whose PGID a reused PID now owns (PR #9)",
+  "stokastisk-0.1.0.dist-info/METADATA": "Requires-Dist: pydantic-settings==2.16.2 -> pydantic-settings<2.17,>=2.16.2 (requirements/metadata-compat.txt); nothing else",
+  "stokastisk-0.1.0.dist-info/WHEEL": "Build: 5 -> Build: 6",
+  "stokastisk-0.1.0.dist-info/RECORD": "hashes of the three members above"
+ }
+}

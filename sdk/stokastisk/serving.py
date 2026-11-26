@@ -29,6 +29,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -161,6 +162,45 @@ def _tail(path: str | None, max_lines: int = 40, max_chars: int = 6000) -> str:
     return "\n".join(lines[-max_lines:])[-max_chars:] or "(the server wrote nothing)"
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(url_or_request: Any, timeout: float):
+    """``urlopen`` that never sends LOOPBACK requests through a proxy. Plain ``urlopen`` honours ``http_proxy`` and bypasses it only for hosts listed in
+    ``no_proxy``, so with a proxy variable set a request to the local server at 127.0.0.1 went to the proxy. Other hosts are unchanged."""
+    from urllib.parse import urlparse
+    url = url_or_request.full_url if isinstance(url_or_request, urllib.request.Request) else str(url_or_request)
+    if (urlparse(url).hostname or "") in _LOOPBACK_HOSTS:
+        return _DIRECT_OPENER.open(url_or_request, timeout=timeout)
+    return urllib.request.urlopen(url_or_request, timeout=timeout)
+
+
+def _proc_ids(pid: int) -> tuple[int, int] | None:
+    """(process group, session) of ``pid`` from /proc/<pid>/stat, or None if it is gone or is a zombie."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            rest = fh.read().rsplit(b")", 1)[1].split()
+    except OSError:
+        return None
+    if rest[0] in (b"Z", b"X"):
+        return None
+    return int(rest[2]), int(rest[3])
+
+
+def _group_members(pgid: int) -> list[int]:
+    """Live processes whose process group AND session both equal ``pgid`` (a ``start_new_session`` server and every descendant that kept its group)."""
+    out = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for n in names:
+        if n.isdigit() and _proc_ids(int(n)) == (pgid, pgid):
+            out.append(int(n))
+    return out
+
+
 class ServerProcess:
     """Supervise one ``vllm serve`` child. Use as a context manager. Never started implicitly, never left running by ``with``."""
 
@@ -178,6 +218,7 @@ class ServerProcess:
         self._pgid: int | None = None
         self._log = None
         self.shutdown_report: dict[str, Any] = {}
+        self._lifecycle = threading.RLock()                 # start() and stop() never interleave (a second stop() waits for the first, then returns None)
 
     @property
     def base_url(self) -> str:
@@ -199,6 +240,10 @@ class ServerProcess:
         return ServerStartupError(reason, exit_code=exit_code, command=self.command, log_path=self.log_path, log_excerpt=_tail(self.log_path), timeout=timeout, waited=waited)
 
     def start(self) -> "ServerProcess":
+        with self._lifecycle:
+            return self._start_unlocked()
+
+    def _start_unlocked(self) -> "ServerProcess":
         check_feature("openai_server")            # returns the feature record; raises only if the feature became blocking
         missing = check_server_requirements()
         if missing:
@@ -232,7 +277,7 @@ class ServerProcess:
     def health(self, timeout: float = 5.0) -> bool:
         """True if ``GET /health`` answers 200 right now."""
         try:
-            with urllib.request.urlopen(self.base_url + "/health", timeout=timeout) as r:
+            with _urlopen(self.base_url + "/health", timeout=timeout) as r:
                 return r.status == 200
         except (urllib.error.URLError, OSError, ValueError):
             return False
@@ -278,11 +323,65 @@ class ServerProcess:
         except PermissionError:           # pragma: no cover - the group exists but is not ours
             return True
 
+    def _group_is_foreign(self, leader: subprocess.Popen | None) -> bool:
+        """True if our PGID number now names SOMEONE ELSE's process group (PID reuse after our leader was reaped).
+
+        Linux never allocates a PID that is still used as a process-group id. So once our leader has been reaped (``returncode`` set), a live process whose
+        PID equals our PGID cannot be ours, while our own orphaned descendants (engine core, TP workers) never have that PID. Until it is reaped, the leader
+        (even as a zombie) still holds the PID, and the group is ours. On Kaggle everything runs as root, so the kernel would not refuse a wrong signal."""
+        if self._pgid is None or leader is None or leader.returncode is None:
+            return False
+        try:
+            os.kill(self._pgid, 0)
+        except ProcessLookupError:
+            return False                  # nobody holds PID == PGID: any remaining members are our own orphaned descendants
+        except PermissionError:
+            return True
+        return True
+
     def stop(self, grace: float = 30.0) -> int | None:
         """SIGINT the process group (vLLM's own graceful shutdown), then SIGTERM, then SIGKILL; then make sure no process of the group survives.
 
         Returns the exit code of the server process. ``shutdown_report`` records which signals were needed and whether any child survived the leader (those are SIGKILLed).
         Raises :class:`ServerShutdownError` only if a process of the group could not be killed."""
+        with self._lifecycle:                              # serialised with start() and with concurrent stop() calls
+            return self._stop_unlocked(grace)
+
+    def _kill_orphans(self, pgid: int) -> tuple[int, int]:
+        """SIGKILL the surviving members of OUR group after the leader has been reaped, one process at a time, without any check-then-signal race.
+
+        ``killpg`` is never used here: once the leader is reaped its group id is only reserved while a member lives, so a group that empties between a
+        check and a ``killpg`` could be re-created by an unrelated new session leader. Instead every candidate (process group AND session == ``pgid``,
+        read from /proc) is pinned with ``pidfd_open``, re-verified AFTER pinning, and signalled through the pidfd, which can never reach a different
+        process. Without pidfd support nothing is signalled (conservative refusal). Returns (signalled, refused)."""
+        if getattr(os, "pidfd_open", None) is None or getattr(signal, "pidfd_send_signal", None) is None:
+            log.warning("pidfd is unavailable: not signalling the orphaned members of process group %s", pgid)
+            return 0, len(_group_members(pgid))
+        done = refused = 0
+        for pid in _group_members(pgid):
+            if pid == pgid:
+                refused += 1                                     # the leader is reaped, so a process holding the PGID number is not ours
+                continue
+            try:
+                fd = os.pidfd_open(pid)
+            except (ProcessLookupError, OSError):
+                continue                                         # already gone
+            try:
+                ident = _proc_ids(pid)
+                if ident is None or ident != (pgid, pgid):      # identity re-checked while the pidfd pins the process
+                    refused += 1
+                    continue
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                done += 1
+            except ProcessLookupError:
+                log.debug("orphan %s exited before it was signalled", pid)
+            except PermissionError:
+                refused += 1
+            finally:
+                os.close(fd)
+        return done, refused
+
+    def _stop_unlocked(self, grace: float = 30.0) -> int | None:
         p, self._proc = self._proc, None
         pgid, self._pgid = self._pgid, None
         if p is None:
@@ -301,24 +400,52 @@ class ServerProcess:
             except subprocess.TimeoutExpired:
                 continue
         survivors = False
-        end = time.monotonic() + 5.0
         self._pgid = pgid
-        while self._group_alive() and time.monotonic() < end:         # children of the leader (engine core, TP workers) may outlive it for a moment
+        foreign = self._group_is_foreign(p)               # never signal a group that a reused PID now owns
+
+        def alive() -> bool:
+            """Does any process of OUR group survive? Unreaped leader: the group id is still ours. Reaped leader: re-check ownership every time and count
+            only members whose group and session are ours (never the PGID number itself, which our descendants cannot hold)."""
+            nonlocal foreign
+            if foreign:
+                return False
+            if p.poll() is None:
+                return self._group_alive()
+            if self._group_is_foreign(p):
+                foreign = True
+                return False
+            return any(m != pgid for m in _group_members(pgid))
+
+        if foreign:
+            log.warning("process group %s now belongs to another process (PID reuse after the server exited); not signalling it", pgid)
+        end = time.monotonic() + 5.0
+        while alive() and time.monotonic() < end:          # children of the leader (engine core, TP workers) may outlive it for a moment
             time.sleep(0.2)
-        if self._group_alive():
+        orphan_refusals = 0
+        if alive():
             survivors = True
-            try:
-                os.killpg(pgid, signal.SIGKILL); sent.append("SIGKILL(group)")
-            except ProcessLookupError:
-                log.debug("ignored ProcessLookupError (best-effort probe)", exc_info=True)
+            if p.poll() is None:                                # the leader still holds the PID (even as an unreaped zombie): the group id is ours
+                try:
+                    os.killpg(pgid, signal.SIGKILL); sent.append("SIGKILL(group)")
+                except ProcessLookupError:
+                    log.debug("ignored ProcessLookupError (best-effort probe)", exc_info=True)
+                except PermissionError:
+                    log.warning("process group %s is not ours (EPERM); not signalling it", pgid)
+                    foreign = True
+            else:                                               # leader reaped: per-process, pidfd-pinned, identity-verified
+                killed, orphan_refusals = self._kill_orphans(pgid)
+                sent.append(f"SIGKILL(orphans={killed})")
             end = time.monotonic() + 5.0
-            while self._group_alive() and time.monotonic() < end:
+            while alive() and time.monotonic() < end:
                 time.sleep(0.2)
-        still = self._group_alive()
+        if foreign:
+            log.warning("process group %s now belongs to another process; it was not signalled", pgid)
+        still = alive()
         self._pgid = None
         if self._log:
             self._log.close(); self._log = None
-        self.shutdown_report = {"signals": sent, "graceful": sent in ([], ["SIGINT"]), "exit_code": p.returncode, "children_survived_leader": survivors, "group_gone": not still}
+        self.shutdown_report = {"signals": sent, "graceful": sent in ([], ["SIGINT"]), "exit_code": p.returncode, "children_survived_leader": survivors, "group_gone": not still,
+                                "foreign_group_refused": foreign, "orphan_signals_refused": orphan_refusals}
         if still:
             raise ServerShutdownError(f"processes of the server's process group {pgid} survived SIGKILL; log: {self.log_path}")
         return p.returncode
@@ -334,7 +461,7 @@ class ServerProcess:
 def _post_json(url: str, body: dict[str, Any], timeout: float):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        return _urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         raise ServerHTTPError(f"POST {url} failed", status=e.code, body=_read_error(e)) from e
     except (urllib.error.URLError, OSError) as e:
@@ -350,7 +477,7 @@ def _read_error(e: urllib.error.HTTPError) -> str:
 
 def _get(url: str, timeout: float) -> bytes:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with _urlopen(url, timeout=timeout) as r:
             return r.read()
     except urllib.error.HTTPError as e:
         raise ServerHTTPError(f"GET {url} failed", status=e.code, body=_read_error(e)) from e
