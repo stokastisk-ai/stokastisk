@@ -1,6 +1,6 @@
 #!/usr/bin/env python3.13
 """Member-by-member delta between two integrated Stokastisk wheels (e.g. the published build 3 and a new build).
-usage: wheel_delta.py OLD_WHEEL NEW_WHEEL OUT.json [--allow-sdk stokastisk/compat.py ...] [--docstring-only stokastisk/serving.py ...] [--ast-identical stokastisk/compat.py:check_dtype,check_feature ...] [--literals-only stokastisk/serving.py ...] [--requires-compat requirements/metadata-compat.txt]
+usage: wheel_delta.py OLD_WHEEL NEW_WHEEL OUT.json [--allow-sdk stokastisk/compat.py ...] [--docstring-only stokastisk/serving.py ...] [--ast-identical stokastisk/compat.py:check_dtype,check_feature ...] [--literals-only stokastisk/serving.py ...]
 
 Classifies every member (vllm/**, native binaries, stokastisk/**, dist-info, data) and reports identical / changed / added / removed with sha256 values. The result is PASS only when:
 all vllm/** members and all native objects are byte-identical, no Flash-family path or binary exists in the new wheel, METADATA differs only in its description and the build/WHEEL tag
@@ -53,22 +53,7 @@ def _strings(tree):
     return sorted({n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)})
 
 
-def _req_name(line: str) -> str:
-    return re.sub(r"[-_.]+", "-", re.split(r"[ ;=<>!~\[(]", line.split(":", 1)[1].strip())[0]).lower()
-
-
-def load_requires_compat(path) -> dict[str, str]:
-    """{canonical name: 'name>=X,<Y'} from requirements/metadata-compat.txt (comments and blank lines ignored)."""
-    out = {}
-    for ln in pathlib.Path(path).read_text().splitlines():
-        ln = ln.split("#")[0].strip()
-        if ln:
-            from packaging.requirements import Requirement
-            out[re.sub(r"[-_.]+", "-", Requirement(ln).name).lower()] = str(Requirement(ln))
-    return out
-
-
-def delta(old_path, new_path, allow_sdk, docstring_only=(), ast_identical=(), literals_only=(), requires_compat=None):
+def delta(old_path, new_path, allow_sdk, docstring_only=(), ast_identical=(), literals_only=()):
     a, b = zipfile.ZipFile(old_path), zipfile.ZipFile(new_path)
     an, bn = set(a.namelist()), set(b.namelist())
     changed = sorted(n for n in an & bn if a.read(n) != b.read(n))
@@ -95,14 +80,7 @@ def delta(old_path, new_path, allow_sdk, docstring_only=(), ast_identical=(), li
     chk("only METADATA, WHEEL and RECORD changed in the dist-info", set(summary["by_category_changed"]["dist-info"]) <= {f"{DI}/METADATA", f"{DI}/WHEEL", f"{DI}/RECORD"}, summary["by_category_changed"]["dist-info"])
     chk("no other member category changed", not summary["by_category_changed"]["other"], summary["by_category_changed"]["other"])
     ma, mb = a.read(f"{DI}/METADATA").decode(), b.read(f"{DI}/METADATA").decode()
-    if not requires_compat:
-        chk("every dependency pin is identical (Requires-Dist / Provides-Extra / Requires-Python)", requires(ma) == requires(mb), sorted(set(requires(ma)) ^ set(requires(mb)))[:6])
-    else:
-        gone, came = sorted(set(requires(ma)) - set(requires(mb))), sorted(set(requires(mb)) - set(requires(ma)))
-        want_gone = sorted(l for l in requires(ma) if _req_name(l) in requires_compat)
-        want_came = sorted(f"Requires-Dist: {spec}" for spec in requires_compat.values())
-        chk("dependency pins are identical except the declared bounded compatibility ranges (requirements/metadata-compat.txt)",
-            gone == want_gone and came == want_came and len(gone) == len(requires_compat), {"removed": gone, "added": came})
+    chk("every dependency pin is identical (Requires-Dist / Provides-Extra / Requires-Python)", requires(ma) == requires(mb), sorted(set(requires(ma)) ^ set(requires(mb)))[:6])
     chk("METADATA headers (name, version, license, ...) are identical apart from the description", header_without_description(ma) == header_without_description(mb), sorted(set(header_without_description(ma)) ^ set(header_without_description(mb)))[:4])
     wa, wb = a.read(f"{DI}/WHEEL").decode(), b.read(f"{DI}/WHEEL").decode()
     strip = lambda w: [l for l in w.splitlines() if not l.startswith("Build:")]  # noqa: E731
@@ -134,13 +112,11 @@ def delta(old_path, new_path, allow_sdk, docstring_only=(), ast_identical=(), li
 
 
 def main(argv):
-    opts = {"--allow-sdk": [], "--docstring-only": [], "--ast-identical": [], "--literals-only": [], "--requires-compat": []}
+    opts = {"--allow-sdk": [], "--docstring-only": [], "--ast-identical": [], "--literals-only": []}
     for k in opts:
         while k in argv:
             i = argv.index(k); opts[k].append(argv[i + 1]); del argv[i:i + 2]
-    compat = load_requires_compat(opts["--requires-compat"][0]) if opts["--requires-compat"] else None
-    rep = delta(argv[0], argv[1], opts["--allow-sdk"], opts["--docstring-only"], opts["--ast-identical"], opts["--literals-only"], compat)
-    rep["requires_compat"] = compat
+    rep = delta(argv[0], argv[1], opts["--allow-sdk"], opts["--docstring-only"], opts["--ast-identical"], opts["--literals-only"])
     pathlib.Path(argv[2]).write_text(json.dumps(rep, indent=1, sort_keys=True) + "\n")
     print("OVERALL:", rep["status"])
     return 0 if rep["status"] == "PASS" else 1

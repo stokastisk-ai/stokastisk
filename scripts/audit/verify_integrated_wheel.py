@@ -54,17 +54,9 @@ def main(wheel, vllm_wheel, out):
     for prof in ("core", "structured-output", "serving"):
         roots += [l.split("#")[0].strip() for l in (ROOT / "requirements" / f"{prof}.roots").read_text().splitlines() if l.split("#")[0].strip()]
     norm = lambda r: (canon(re.split(r"[=<>!~\[ ]", r)[0]), r.split("==")[-1])  # noqa: E731
+    chk("METADATA requires every lock root exactly (core + structured-output + serving; names compared canonically)", {norm(r) for r in roots} <= {norm(r) for r in reqs}, [r for r in roots if norm(r) not in {norm(x) for x in reqs}])
     pins = {f"{m.group(1)}=={m.group(2)}" for prof in ("core", "structured-output", "serving") for m in re.finditer(r"^([A-Za-z0-9_.\-]+)==(\S+) \\$", (ROOT / "requirements" / f"{prof}.lock").read_text(), re.M)}
-    # Declared bounded compatibility ranges (requirements/metadata-compat.txt, validated by metadata_compat: lower bound == locked version, one minor series).
-    # For those packages ONLY, METADATA must carry exactly the validated range instead of the exact pin; every other lock pin stays exact.
-    import metadata_compat
-    compat = metadata_compat.load(ROOT / "requirements" / "metadata-compat.txt", {canon(x.split("==")[0]): x.split("==")[1] for x in pins})
-    exact = {x for x in pins if canon(x.split("==")[0]) not in compat}
-    chk("declared compatibility ranges appear in METADATA exactly as validated (and replace their exact pins)",
-        all(spec in reqs for spec in compat.values()) and not any(canon(x.split("==")[0]) in compat for x in reqs if "==" in x), {"compat": compat})
-    roots_exact = [r for r in roots if canon(re.split(r"[=<>!~\[ ]", r)[0]) not in compat]
-    chk("METADATA requires every lock root exactly (core + structured-output + serving; names compared canonically; declared compatibility ranges aside)", {norm(r) for r in roots_exact} <= {norm(r) for r in reqs}, [r for r in roots_exact if norm(r) not in {norm(x) for x in reqs}])
-    chk("METADATA pins EVERY package of the three locks exactly (a plain `pip install` can never float a transitive package or upgrade a protected one; declared compatibility ranges aside)", exact <= set(reqs) and len(pins) >= 19, sorted(exact - set(reqs)))
+    chk("METADATA pins EVERY package of the three locks exactly (a plain `pip install` can never float a transitive package or upgrade a protected one)", pins <= set(reqs) and len(pins) >= 19, sorted(pins - set(reqs)))
     chk("METADATA pins torch==2.11.0+cu130 and triton==3.6.0, transformers>=5.5.3,<6", {"torch==2.11.0+cu130", "triton==3.6.0", "transformers>=5.5.3,<6"} <= set(reqs))
     chk("METADATA does not require xgrammar<…transformers caps: xgrammar==0.2.3", "xgrammar==0.2.3" in reqs and not any(canon(r.split("=")[0]) == "xgrammar" and "0.2.5" in r for r in reqs))
     chk("models extra present, not in the default requirements", "Provides-Extra: models" in meta and "compressed-tensors" not in " ".join(reqs))

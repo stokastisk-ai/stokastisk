@@ -1,7 +1,7 @@
 #!/usr/bin/env python3.13
 """Build, audit and describe one integrated Stokastisk wheel (build tag N >= 3) WITHOUT any GPU, Kaggle or network access.
 usage: build_wheel_release.py --build-tag N --out DIR [--reference-wheel OLD.whl] [--allow-sdk stokastisk/x.py ...] [--docstring-only stokastisk/x.py ...]
-                              [--ast-identical stokastisk/x.py:name,name ...] [--literals-only stokastisk/x.py ...] [--reproduce] [--cpu-tests "<command>=<result>"] [--requires-compat requirements/metadata-compat.txt]
+                              [--ast-identical stokastisk/x.py:name,name ...] [--literals-only stokastisk/x.py ...] [--reproduce] [--cpu-tests "<command>=<result>"]
 
 DIR must not exist and nothing is ever overwritten. Steps: build (scripts/release/build_integrated_wheel.py, from the byte-pinned vLLM wheel in inputs/), independent verification
 (scripts/audit/verify_integrated_wheel.py), member-by-member delta against a previous wheel when --reference-wheel is given (scripts/audit/wheel_delta.py), optional second build to prove reproducibility, and
@@ -30,7 +30,6 @@ def main(argv):
     tag, out, ref = opt(argv, "--build-tag"), opt(argv, "--out"), opt(argv, "--reference-wheel")
     allow, docs, asts, lits = opt(argv, "--allow-sdk", True), opt(argv, "--docstring-only", True), opt(argv, "--ast-identical", True), opt(argv, "--literals-only", True)
     cpu = opt(argv, "--cpu-tests", True)
-    compat = opt(argv, "--requires-compat")
     reproduce = "--reproduce" in argv
     assert tag and tag.isdigit() and int(tag) >= 3 and out, __doc__
     out = pathlib.Path(out)
@@ -50,7 +49,6 @@ def main(argv):
         for a in docs: cmd += ["--docstring-only", a]
         for a in asts: cmd += ["--ast-identical", a]
         for a in lits: cmd += ["--literals-only", a]
-        if compat: cmd += ["--requires-compat", compat]
         run(cmd); delta = json.loads((out / "reports/delta-vs-reference.json").read_text())
     repro = None
     if reproduce:
