@@ -278,6 +278,22 @@ class ServerProcess:
         except PermissionError:           # pragma: no cover - the group exists but is not ours
             return True
 
+    def _group_is_foreign(self, leader: subprocess.Popen | None) -> bool:
+        """True if our PGID number now names SOMEONE ELSE's process group (PID reuse after our leader was reaped).
+
+        Linux never allocates a PID that is still used as a process-group id. So once our leader has been reaped (``returncode`` set), a live process whose
+        PID equals our PGID cannot be ours, while our own orphaned descendants (engine core, TP workers) never have that PID. Until it is reaped, the leader
+        (even as a zombie) still holds the PID, and the group is ours. On Kaggle everything runs as root, so the kernel would not refuse a wrong signal."""
+        if self._pgid is None or leader is None or leader.returncode is None:
+            return False
+        try:
+            os.kill(self._pgid, 0)
+        except ProcessLookupError:
+            return False                  # nobody holds PID == PGID: any remaining members are our own orphaned descendants
+        except PermissionError:
+            return True
+        return True
+
     def stop(self, grace: float = 30.0) -> int | None:
         """SIGINT the process group (vLLM's own graceful shutdown), then SIGTERM, then SIGKILL; then make sure no process of the group survives.
 
@@ -303,22 +319,30 @@ class ServerProcess:
         survivors = False
         end = time.monotonic() + 5.0
         self._pgid = pgid
-        while self._group_alive() and time.monotonic() < end:         # children of the leader (engine core, TP workers) may outlive it for a moment
+        foreign = self._group_is_foreign(p)               # never signal a group that a reused PID now owns
+        if foreign:
+            log.warning("process group %s now belongs to another process (PID reuse after the server exited); not signalling it", pgid)
+            end = 0.0
+        while not foreign and self._group_alive() and time.monotonic() < end:         # children of the leader (engine core, TP workers) may outlive it for a moment
             time.sleep(0.2)
-        if self._group_alive():
+        if not foreign and self._group_alive():
             survivors = True
             try:
                 os.killpg(pgid, signal.SIGKILL); sent.append("SIGKILL(group)")
             except ProcessLookupError:
                 log.debug("ignored ProcessLookupError (best-effort probe)", exc_info=True)
+            except PermissionError:
+                log.warning("process group %s is not ours (EPERM); not signalling it", pgid)
+                foreign = True
             end = time.monotonic() + 5.0
             while self._group_alive() and time.monotonic() < end:
                 time.sleep(0.2)
-        still = self._group_alive()
+        still = False if foreign else self._group_alive()
         self._pgid = None
         if self._log:
             self._log.close(); self._log = None
-        self.shutdown_report = {"signals": sent, "graceful": sent in ([], ["SIGINT"]), "exit_code": p.returncode, "children_survived_leader": survivors, "group_gone": not still}
+        self.shutdown_report = {"signals": sent, "graceful": sent in ([], ["SIGINT"]), "exit_code": p.returncode, "children_survived_leader": survivors, "group_gone": not still,
+                                "foreign_group_refused": foreign}
         if still:
             raise ServerShutdownError(f"processes of the server's process group {pgid} survived SIGKILL; log: {self.log_path}")
         return p.returncode
