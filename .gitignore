@@ -65,3 +65,8 @@ inputs/
 
 # the archived release audits are evidence, not temporary reports
 !evidence/release/*/reports/
+
+# private agent/operations notes (never published)
+/CLAUDE.md
+/CLAUDE-*.md
+/.claude/
